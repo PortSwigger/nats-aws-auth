@@ -1,5 +1,7 @@
 # Build artifacts
 /out/
+/nats-aws-auth
+/server
 coverage.out
 
 # Runtime directories
