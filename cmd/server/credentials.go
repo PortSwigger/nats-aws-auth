@@ -46,15 +46,15 @@ func formatCredentials(userJWT, seed string) string {
 `, userJWT, seed)
 }
 
-// runGenerateCredentials generates NACK credentials signed by the APP account KMS key.
-func runGenerateCredentials(ctx context.Context, logger *zap.Logger, region, appAccountKeyAlias, outputDir string) {
-	client := setupAWSClient(ctx, logger, region)
-
+// runGenerateCredentials generates NACK credentials signed by the APP account key.
+func runGenerateCredentials(ctx context.Context, logger *zap.Logger, keyStore KeyStore, appAccountKeyAlias, outputDir string) {
 	logger.Info("Generating NACK credentials...")
 
-	// Step 1: Get or create APP account key in KMS
-	logger.Info("Getting/creating APP account key in KMS...", zap.String("alias", appAccountKeyAlias))
-	appAccountKey, appExisted, err := getOrCreateKMSKey(ctx, client, nkeys.PrefixByteAccount, appAccountKeyAlias)
+	// Step 1: Get or create APP account key
+	logger.Info("Getting/creating APP account key...",
+		zap.String("name", appAccountKeyAlias),
+		zap.String("key_storage", keyStore.Name()))
+	appAccountKey, appExisted, err := keyStore.GetOrCreate(ctx, nkeys.PrefixByteAccount, appAccountKeyAlias)
 	if err != nil {
 		logger.Fatal("Failed to get/create APP account key", zap.Error(err))
 	}
@@ -68,13 +68,11 @@ func runGenerateCredentials(ctx context.Context, logger *zap.Logger, region, app
 	}
 	logger.Debug("NACK User Public Key", zap.String("public_key", nackKey.PublicKey))
 
-	// Step 3: Create NACK user JWT signed by APP account key via KMS
-	logger.Info("Creating NACK user JWT (signed by APP account via KMS)...")
+	// Step 3: Create NACK user JWT signed by APP account key
+	logger.Info("Creating NACK user JWT (signed by APP account)...")
 	nackClaims := createNackUserClaims(nackKey.PublicKey, appAccountKey.PublicKey)
-	appAccountKP := &dummyKeyPair{pubKey: appAccountKey.PublicKey}
-	appAccountSigner := createKMSSigner(ctx, client, appAccountKey.KeyID)
 
-	nackJWT, err := nackClaims.EncodeWithSigner(appAccountKP, appAccountSigner)
+	nackJWT, err := nackClaims.EncodeWithSigner(appAccountKey.KeyPair, appAccountKey.Signer)
 	if err != nil {
 		logger.Fatal("Failed to encode NACK user JWT", zap.Error(err))
 	}

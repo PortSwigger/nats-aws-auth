@@ -8,9 +8,11 @@ import (
 	"crypto/ed25519"
 	"crypto/x509"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -25,11 +27,27 @@ import (
 // Type Definitions
 // ==========================================
 
-// KMSKey holds information about a KMS-backed key
-type KMSKey struct {
-	KeyID     string
-	PublicKey string // nkey-formatted public key
-	RawPubKey []byte // raw 32-byte Ed25519 public key
+// StoredKey is a signing key loaded from a KeyStore.
+type StoredKey struct {
+	PublicKey string
+	Reference string
+	KeyPair   nkeys.KeyPair
+	Signer    jwt.SignFn
+}
+
+// KeyStore loads and creates the persistent signing keys used by the service.
+type KeyStore interface {
+	Get(ctx context.Context, prefix nkeys.PrefixByte, name string) (*StoredKey, error)
+	GetOrCreate(ctx context.Context, prefix nkeys.PrefixByte, name string) (*StoredKey, bool, error)
+	Name() string
+}
+
+type kmsKeyStore struct {
+	client *kms.Client
+}
+
+type directoryKeyStore struct {
+	dir string
 }
 
 // LocalKey holds information about a locally generated key
@@ -89,6 +107,40 @@ func loadAWSConfig(ctx context.Context, region string) (aws.Config, error) {
 	return config.LoadDefaultConfig(ctx)
 }
 
+func newKeyStore(ctx context.Context, storage, region, keyDir string) (KeyStore, error) {
+	switch storage {
+	case "kms":
+		cfg, err := loadAWSConfig(ctx, region)
+		if err != nil {
+			return nil, fmt.Errorf("load AWS config: %w", err)
+		}
+		return &kmsKeyStore{client: kms.NewFromConfig(cfg)}, nil
+	case "directory":
+		if keyDir == "" {
+			return nil, fmt.Errorf("--key-dir is required when --key-storage=directory")
+		}
+		return &directoryKeyStore{dir: keyDir}, nil
+	default:
+		return nil, fmt.Errorf("unsupported key storage %q (expected \"kms\" or \"directory\")", storage)
+	}
+}
+
+func (s *kmsKeyStore) Name() string {
+	return "AWS KMS"
+}
+
+func (s *kmsKeyStore) Get(ctx context.Context, prefix nkeys.PrefixByte, name string) (*StoredKey, error) {
+	aliasName := name
+	if !strings.HasPrefix(aliasName, "alias/") {
+		aliasName = "alias/" + aliasName
+	}
+	return getExistingKMSKey(ctx, s.client, aliasName, prefix)
+}
+
+func (s *kmsKeyStore) GetOrCreate(ctx context.Context, prefix nkeys.PrefixByte, name string) (*StoredKey, bool, error) {
+	return getOrCreateKMSKey(ctx, s.client, prefix, name)
+}
+
 // createKMSSigner creates a SignFn that signs using AWS KMS
 func createKMSSigner(ctx context.Context, client *kms.Client, keyID string) jwt.SignFn {
 	return func(pub string, data []byte) ([]byte, error) {
@@ -138,7 +190,7 @@ func extractEd25519PublicKey(derBytes []byte) ([]byte, error) {
 
 // getOrCreateKMSKey checks if a KMS key with the given alias exists and is the correct type.
 // If it exists and is valid, it returns the existing key. Otherwise, it creates a new one.
-func getOrCreateKMSKey(ctx context.Context, client *kms.Client, prefix nkeys.PrefixByte, alias string) (*KMSKey, bool, error) {
+func getOrCreateKMSKey(ctx context.Context, client *kms.Client, prefix nkeys.PrefixByte, alias string) (*StoredKey, bool, error) {
 	aliasName := alias
 	if !strings.HasPrefix(aliasName, "alias/") {
 		aliasName = "alias/" + aliasName
@@ -161,7 +213,7 @@ func getOrCreateKMSKey(ctx context.Context, client *kms.Client, prefix nkeys.Pre
 }
 
 // getExistingKMSKey attempts to retrieve an existing KMS key by alias and validates its type
-func getExistingKMSKey(ctx context.Context, client *kms.Client, aliasName string, prefix nkeys.PrefixByte) (*KMSKey, error) {
+func getExistingKMSKey(ctx context.Context, client *kms.Client, aliasName string, prefix nkeys.PrefixByte) (*StoredKey, error) {
 	// Try to describe the key using the alias
 	describeOutput, err := client.DescribeKey(ctx, &kms.DescribeKeyInput{
 		KeyId: aws.String(aliasName),
@@ -210,15 +262,16 @@ func getExistingKMSKey(ctx context.Context, client *kms.Client, aliasName string
 		return nil, fmt.Errorf("failed to encode public key in nkey format: %w", err)
 	}
 
-	return &KMSKey{
-		KeyID:     keyID,
+	return &StoredKey{
+		Reference: keyID,
 		PublicKey: string(nkeyPublic),
-		RawPubKey: rawPubKey,
+		KeyPair:   &dummyKeyPair{pubKey: string(nkeyPublic)},
+		Signer:    createKMSSigner(ctx, client, keyID),
 	}, nil
 }
 
 // createKMSKey creates a new KMS key with the given alias
-func createKMSKey(ctx context.Context, client *kms.Client, prefix nkeys.PrefixByte, aliasName string) (*KMSKey, error) {
+func createKMSKey(ctx context.Context, client *kms.Client, prefix nkeys.PrefixByte, aliasName string) (*StoredKey, error) {
 	// Create the KMS asymmetric key with Ed25519
 	createKeyInput := &kms.CreateKeyInput{
 		KeySpec:     "ECC_NIST_EDWARDS25519",
@@ -267,11 +320,124 @@ func createKMSKey(ctx context.Context, client *kms.Client, prefix nkeys.PrefixBy
 		return nil, fmt.Errorf("failed to encode public key in nkey format: %w", err)
 	}
 
-	return &KMSKey{
-		KeyID:     keyID,
+	return &StoredKey{
+		Reference: keyID,
 		PublicKey: string(nkeyPublic),
-		RawPubKey: rawPubKey,
+		KeyPair:   &dummyKeyPair{pubKey: string(nkeyPublic)},
+		Signer:    createKMSSigner(ctx, client, keyID),
 	}, nil
+}
+
+func (s *directoryKeyStore) Name() string {
+	return "local directory"
+}
+
+func (s *directoryKeyStore) Get(ctx context.Context, prefix nkeys.PrefixByte, name string) (*StoredKey, error) {
+	_ = ctx
+
+	path, err := s.keyPath(name)
+	if err != nil {
+		return nil, err
+	}
+	seed, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read key %q: %w", name, err)
+	}
+
+	return storedKeyFromSeed(prefix, name, seed)
+}
+
+func (s *directoryKeyStore) GetOrCreate(ctx context.Context, prefix nkeys.PrefixByte, name string) (*StoredKey, bool, error) {
+	key, err := s.Get(ctx, prefix, name)
+	if err == nil {
+		return key, true, nil
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		return nil, false, err
+	}
+
+	path, err := s.keyPath(name)
+	if err != nil {
+		return nil, false, err
+	}
+	if err := os.MkdirAll(s.dir, 0700); err != nil {
+		return nil, false, fmt.Errorf("create key directory: %w", err)
+	}
+
+	localKey, err := createLocalKey(prefix)
+	if err != nil {
+		return nil, false, err
+	}
+
+	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+	if os.IsExist(err) {
+		key, loadErr := s.Get(ctx, prefix, name)
+		return key, true, loadErr
+	}
+	if err != nil {
+		return nil, false, fmt.Errorf("create key %q: %w", name, err)
+	}
+
+	seed := []byte(localKey.Seed + "\n")
+	if _, err := file.Write(seed); err != nil {
+		_ = file.Close()
+		_ = os.Remove(path)
+		return nil, false, fmt.Errorf("write key %q: %w", name, err)
+	}
+	if err := file.Close(); err != nil {
+		_ = os.Remove(path)
+		return nil, false, fmt.Errorf("close key %q: %w", name, err)
+	}
+
+	return storedKeyFromLocalKey(name, localKey), false, nil
+}
+
+func (s *directoryKeyStore) keyPath(name string) (string, error) {
+	name = strings.TrimPrefix(name, "alias/")
+	if name == "" || filepath.Base(name) != name || name == "." {
+		return "", fmt.Errorf("invalid key name %q", name)
+	}
+	return filepath.Join(s.dir, name+".nk"), nil
+}
+
+func storedKeyFromSeed(prefix nkeys.PrefixByte, name string, seed []byte) (*StoredKey, error) {
+	seed = []byte(strings.TrimSpace(string(seed)))
+	actualPrefix, _, err := nkeys.DecodeSeed(seed)
+	if err != nil {
+		return nil, fmt.Errorf("decode key %q: %w", name, err)
+	}
+	if actualPrefix != prefix {
+		return nil, fmt.Errorf("key %q has prefix %s, expected %s", name, actualPrefix, prefix)
+	}
+
+	keyPair, err := nkeys.FromSeed(seed)
+	if err != nil {
+		return nil, fmt.Errorf("load key %q: %w", name, err)
+	}
+	publicKey, err := keyPair.PublicKey()
+	if err != nil {
+		return nil, fmt.Errorf("get public key for %q: %w", name, err)
+	}
+
+	return &StoredKey{
+		PublicKey: publicKey,
+		Reference: name,
+		KeyPair:   keyPair,
+		Signer: func(_ string, data []byte) ([]byte, error) {
+			return keyPair.Sign(data)
+		},
+	}, nil
+}
+
+func storedKeyFromLocalKey(name string, key *LocalKey) *StoredKey {
+	return &StoredKey{
+		PublicKey: key.PublicKey,
+		Reference: name,
+		KeyPair:   key.KeyPair,
+		Signer: func(_ string, data []byte) ([]byte, error) {
+			return key.KeyPair.Sign(data)
+		},
+	}
 }
 
 func createLocalKey(prefix nkeys.PrefixByte) (*LocalKey, error) {
