@@ -8,4 +8,6 @@ rules:
   - apiGroups: [""]
     resources: ["serviceaccounts"]
     verbs: ["get", "list", "watch"]
+  - nonResourceURLs: ["/openid/v1/jwks"]
+    verbs: ["get"]
 {{- end }}

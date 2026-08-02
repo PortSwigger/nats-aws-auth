@@ -28,6 +28,17 @@ tests:
             resources: ["serviceaccounts"]
             verbs: ["get", "list", "watch"]
 
+  - it: should allow fetching the Kubernetes JWKS
+    set:
+      rbac:
+        create: true
+    asserts:
+      - contains:
+          path: rules
+          content:
+            nonResourceURLs: ["/openid/v1/jwks"]
+            verbs: ["get"]
+
   - it: should not create ClusterRole when rbac.create is false
     set:
       rbac:
