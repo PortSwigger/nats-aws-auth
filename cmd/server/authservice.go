@@ -694,6 +694,8 @@ func initAuthorizer(ctx context.Context, backend, jwksURL, jwksPath, jwtIssuer, 
 	}
 }
 
+const kubernetesServiceAccountCAPath = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
+
 func initK8sOIDCAuthorizer(ctx context.Context, jwksURL, jwksPath, jwtIssuer, jwtAudience string, logger *zap.Logger) auth.Authorizer {
 	logger.Info("Initializing K8s OIDC auth backend...")
 
@@ -710,7 +712,11 @@ func initJWTValidator(jwksPath, jwksURL, jwtIssuer, jwtAudience string, logger *
 	if jwksPath != "" {
 		validator, err = jwtvalidator.NewValidatorFromFile(jwksPath, jwtIssuer, jwtAudience)
 	} else {
-		validator, err = jwtvalidator.NewValidatorFromURL(jwksURL, jwtIssuer, jwtAudience)
+		var client *http.Client
+		client, err = jwtvalidator.NewHTTPClientWithCAFile(kubernetesServiceAccountCAPath)
+		if err == nil {
+			validator, err = jwtvalidator.NewValidatorFromURL(client, jwksURL, jwtIssuer, jwtAudience)
+		}
 	}
 
 	if err != nil {
