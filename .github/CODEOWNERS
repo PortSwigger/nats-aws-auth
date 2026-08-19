@@ -1,0 +1,56 @@
+# Code owners for nats-aws-auth
+#
+# This repository is a security control. The service is the trust root for NATS authentication: it
+# validates Kubernetes service account tokens, decides which subjects a workload may publish and
+# subscribe to, and holds the AWS identity permitted to kms:Sign with the operator, system and app
+# account keys. A change merged here can mint a credential into any account, or widen what an
+# existing workload is allowed to do, without touching NATS itself.
+#
+# The org default repository permission is write, so every PortSwigger org member can push a
+# branch here. Requiring review from these owners on main is what stops a change to the security
+# posture landing without security or platform seeing it.
+#
+# Owners must have write access to the repository or GitHub silently ignores them. They are named
+# as individual accounts rather than as a GitHub team because a CODEOWNERS entry naming a team that
+# does not exist is silently ignored too.
+#
+# Last matching pattern wins, so the catch-all comes first and the specific paths after it.
+
+# Everything. The whole repository is the control, not one directory of it.
+*                   @portswigger-josh @portswigger-mattlong @portswigger-amason @nresare @ps-pufferfish @Mo-PS
+
+# The authorization decision itself. Authorize() returns the permissions a connection is granted,
+# and AllowAllAuthorizer lives in this package: full access to every subject if it is ever wired in.
+/internal/auth/     @portswigger-josh @portswigger-mattlong @portswigger-amason @nresare @ps-pufferfish @Mo-PS
+
+# Token validation: JWKS retrieval, issuer, audience and expiry checks. Weakening any one of these
+# lets a token this service should not trust through the callout.
+/internal/jwt/      @portswigger-josh @portswigger-mattlong @portswigger-amason @nresare @ps-pufferfish @Mo-PS
+
+# Where permissions actually come from: the nats.io/allowed-pub-subjects and
+# nats.io/allowed-sub-subjects annotations read off watched ServiceAccounts.
+/internal/k8s/      @portswigger-josh @portswigger-mattlong @portswigger-amason @nresare @ps-pufferfish @Mo-PS
+
+# KMS key handling and JWT signing: the operator, system and app account JWTs, and the pre-signed
+# NACK credentials, which are validated against the app account signing keys and so skip the auth
+# callout entirely.
+/cmd/               @portswigger-josh @portswigger-mattlong @portswigger-amason @nresare @ps-pufferfish @Mo-PS
+
+# How it is granted its privileges in a cluster: the cluster-wide read over every ServiceAccount,
+# and the annotation binding this workload to the AWS role allowed to sign with the KMS keys.
+/helm/              @portswigger-josh @portswigger-mattlong @portswigger-amason @nresare @ps-pufferfish @Mo-PS
+
+# The image the service actually runs as.
+/Dockerfile         @portswigger-josh @portswigger-mattlong @portswigger-amason @nresare @ps-pufferfish @Mo-PS
+
+# Dependencies, including the JWT and JWKS verification libraries the callout's trust rests on.
+/go.mod             @portswigger-josh @portswigger-mattlong @portswigger-amason @nresare @ps-pufferfish @Mo-PS
+/go.sum             @portswigger-josh @portswigger-mattlong @portswigger-amason @nresare @ps-pufferfish @Mo-PS
+
+# Run by the release job, so it executes in a workflow holding packages: write and id-token: write.
+/Makefile           @portswigger-josh @portswigger-mattlong @portswigger-amason @nresare @ps-pufferfish @Mo-PS
+
+# Workflows, and this file. The release workflow publishes the image and Helm chart to GHCR and
+# signs them keylessly with this repository's own OIDC identity, which is exactly what consumers
+# verify against. Without this line a PR could also rewrite its own review requirements.
+/.github/           @portswigger-josh @portswigger-mattlong @portswigger-amason @nresare @ps-pufferfish @Mo-PS
