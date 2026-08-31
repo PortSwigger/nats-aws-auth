@@ -1,6 +1,6 @@
 # nats-aws-auth
 
-A NATS authentication service that uses AWS KMS for cryptographic key management. Operator and system account private keys never leave KMS — only public keys are stored locally.
+A NATS authentication service with pluggable cryptographic key storage. Persistent signing keys can be kept in AWS KMS or generated into a local directory.
 
 ## Architecture
 
@@ -10,9 +10,9 @@ A NATS authentication service that uses AWS KMS for cryptographic key management
 
 This tool has three modes:
 
-1. **Config generation** (`--generate`) — Creates a complete `nats-server.conf` with KMS-signed JWTs for the operator, system account, and auth account. Everything needed to boot a NATS server with JWT-based auth.
+1. **Config generation** (`--generate`) — Creates a complete `nats-server.conf` with JWTs signed by keys from the configured storage. Everything needed to boot a NATS server with JWT-based auth.
 
-2. **Credential generation** (`--generate-credentials`) — Creates pre-signed NACK credentials (`nack.creds`) for the JetStream controller. The user JWT is signed by the APP account's KMS key. Run once, store as a K8s secret.
+2. **Credential generation** (`--generate-credentials`) — Creates pre-signed NACK credentials (`nack.creds`) for the JetStream controller. The user JWT is signed by the persistent APP account key. Run once, store as a K8s secret.
 
 3. **Auth service** (default) — Connects to a running NATS server, configures an AUTH account with external authorization (auth callout), creates an APP account with JetStream, and listens for incoming connection requests.
 
@@ -43,7 +43,7 @@ NACK ◄──(authorized, full $JS.API.> access)───┘
 ## Prerequisites
 
 - **Go 1.25+**
-- **AWS credentials** with KMS permissions (`kms:CreateKey`, `kms:Sign`, `kms:GetPublicKey`, `kms:DescribeKey`, `kms:CreateAlias`)
+- **AWS credentials** with KMS permissions (`kms:CreateKey`, `kms:Sign`, `kms:GetPublicKey`, `kms:DescribeKey`, `kms:CreateAlias`) when using the default KMS storage
 - **nats-server** v2.10+ (for auth callout support)
 - **nats CLI** (optional, for testing)
 
@@ -69,6 +69,27 @@ nats-server --config nats-server.conf
 nats pub test.hello "Hello World" --creds sentinel.creds
 ```
 
+For local development, the same workflow can use directory-backed keys without AWS:
+
+```bash
+# Creates keys/nats-operator.nk and keys/nats-sys-account.nk
+./nats-aws-auth --generate \
+  --key-storage=directory \
+  --key-dir=./keys
+
+# Creates/reuses keys/nats-app-account.nk
+./nats-aws-auth --generate-credentials \
+  --key-storage=directory \
+  --key-dir=./keys \
+  --app-account-key-alias=nats-app-account
+
+# Reuses the same operator, SYS, and APP keys
+./nats-aws-auth \
+  --key-storage=directory \
+  --key-dir=./keys \
+  --app-account-key-alias=nats-app-account
+```
+
 ## CLI flags
 
 ### Common
@@ -78,7 +99,10 @@ nats pub test.hello "Hello World" --creds sentinel.creds
 | `--generate` | `false` | Generate server config and exit |
 | `--generate-credentials` | `false` | Generate NACK credentials and exit |
 | `--region` | *(from AWS config)* | AWS region override |
-| `--app-account-key-alias` | | KMS key alias for APP account (e.g. `nats-app-account`). When set, uses a stable KMS-backed key for the APP account identity |
+| `--key-storage` | `kms` | Persistent key storage backend (`kms` or `directory`) |
+| `--key-dir` | `./keys` | Key directory used by `--key-storage=directory` |
+| `--alias-prefix` | `nats` | Prefix for operator and SYS key names (must match between generation and service modes) |
+| `--app-account-key-alias` | | Persistent key name for the APP account (e.g. `nats-app-account`). When set, uses a stable APP account identity |
 
 ### Config generation mode (`--generate`)
 
@@ -87,13 +111,12 @@ nats pub test.hello "Hello World" --creds sentinel.creds
 | `--operator-name` | `KMS-Operator` | Operator name in generated config |
 | `--sys-account` | `SYS` | System account name |
 | `--output` | `.` | Output directory for generated files |
-| `--alias-prefix` | `nats` | Prefix for KMS key aliases (e.g. `nats-operator`, `nats-sys-account`) |
 
 ### Credential generation mode (`--generate-credentials`)
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--app-account-key-alias` | *(required)* | KMS key alias for the APP account |
+| `--app-account-key-alias` | *(required)* | Persistent key name for the APP account |
 | `--output` | `.` | Output directory for `nack.creds` |
 
 ### Auth service mode
@@ -102,7 +125,7 @@ nats pub test.hello "Hello World" --creds sentinel.creds
 |------|---------|-------------|
 | `--auth-account-name` | `AUTH` | Name of the AUTH account |
 | `--app-account-name` | `APP` | Name of the APP account for authorized users |
-| `--app-account-key-alias` | | KMS key alias for stable APP account identity (optional, falls back to ephemeral keys) |
+| `--app-account-key-alias` | | Persistent key name for stable APP account identity (optional, falls back to ephemeral keys) |
 | `--url` | `localhost:4222` | NATS server URL |
 | `--auth-backend` | `allow-all` | Auth backend (`k8s-oidc` or `allow-all`) |
 | `--jwks-url` | | JWKS URL for JWT validation (k8s-oidc backend) |
@@ -113,38 +136,38 @@ nats pub test.hello "Hello World" --creds sentinel.creds
 
 ### Config generation (`--generate`)
 
-1. Creates or reuses two Ed25519 keys in AWS KMS (operator + SYS account)
+1. Creates or reuses two Ed25519 keys in the configured key storage (operator + SYS account)
 2. Generates local keypairs for AUTH account and sentinel user
-3. Signs operator JWT (self-signed via KMS)
-4. Signs SYS and AUTH account JWTs (signed by operator via KMS)
+3. Signs the operator JWT with the operator key
+4. Signs SYS and AUTH account JWTs with the operator key
 5. Creates a bearer-token sentinel user JWT (signed by AUTH account locally)
 6. Writes `nats-server.conf` with embedded JWTs, full resolver, and JetStream config
 
 ### Credential generation (`--generate-credentials`)
 
-1. Gets or creates APP account key in KMS (`alias/<app-account-key-alias>`)
+1. Gets or creates the APP account key in the configured key storage
 2. Generates a NACK user keypair (local, in-memory)
-3. Creates a NACK user JWT signed by the APP account key via KMS, with `$JS.API.>` permissions
+3. Creates a NACK user JWT signed by the APP account key, with `$JS.API.>` permissions
 4. Writes `nack.creds` (JWT + nkey seed)
 
 ### Auth service (default mode)
 
-1. Looks up operator, SYS, and APP account keys from KMS by alias
-2. Connects to NATS as a SYS account user (JWT signed via KMS)
+1. Looks up operator, SYS, and APP account keys in the configured key storage
+2. Connects to NATS as a SYS account user
 3. Fetches all existing account JWTs via `$SYS.REQ.CLAIMS.PACK`
-4. Creates APP account (if new) with KMS-backed identity and JetStream enabled
-5. Registers the KMS key and an ephemeral signing key on the APP account
+4. Creates APP account (if new) with a persistent identity and JetStream enabled
+5. Registers the persistent key and an ephemeral signing key on the APP account
 6. Updates AUTH account with a signing key and external authorization config
 7. Subscribes to `$SYS.REQ.USER.AUTH` and handles auth callout requests
 
-### KMS key management
+### Persistent key management
 
-Keys are identified by alias:
-- `alias/nats-operator` — Operator signing key
-- `alias/nats-sys-account` — SYS account signing key
-- `alias/<app-account-key-alias>` — APP account identity key (optional, for stable pre-signed credentials)
+Keys use the same logical names in both backends:
+- `nats-operator` — Operator signing key
+- `nats-sys-account` — SYS account signing key
+- `<app-account-key-alias>` — APP account identity key (optional, for stable pre-signed credentials)
 
-On first run with `--generate`, operator and SYS keys are created in KMS. On first run with `--generate-credentials`, the APP account key is created. On subsequent runs, existing keys are discovered by alias and reused.
+With KMS storage, these become AWS KMS aliases with the `alias/` prefix. With directory storage, each seed is stored as `<name>.nk`, with new files created using mode `0600`. On subsequent runs, existing keys are loaded and reused. Treat the directory as secret material; directory mode is intended for local development and as a foundation for mounting keys from a Kubernetes Secret.
 
 ## Project structure
 
@@ -155,7 +178,7 @@ nats-aws-auth/
 │   ├── generate.go       # Config generation (--generate)
 │   ├── credentials.go    # NACK credential generation (--generate-credentials)
 │   ├── authservice.go    # Auth service, auth callout handler
-│   └── keys.go           # AWS KMS integration, key types, nkey encoding
+│   └── keys.go           # KMS and directory key storage, key types, nkey encoding
 ├── internal/
 │   ├── jwt/              # JWT validator with JWKS support
 │   ├── k8s/              # K8s ServiceAccount cache with informer
@@ -174,15 +197,17 @@ nats-aws-auth/
 | `nats-server.conf` | NATS server configuration with embedded JWTs | Yes |
 | `nack.creds` | NACK JetStream controller credentials | Yes |
 | `sentinel.creds` | Sentinel user credentials for auth callout testing | Yes |
+| `keys/*.nk` | Directory-backed persistent nkey seeds | Yes |
 | `jwt/` | NATS JWT resolver directory (runtime) | Yes |
 | `jetstream/` | JetStream storage directory (runtime) | Yes |
 
 ## Security notes
 
-- Operator, SYS, and APP account private keys are stored exclusively in AWS KMS — no private key material is ever written to disk or held in memory
+- With KMS storage, Operator, SYS, and APP account private keys remain in AWS KMS
+- With directory storage, those private keys are written as nkey seeds with mode `0600`; protect and back up the directory like any other secret
 - The AUTH account and sentinel user keys are generated locally per session (ephemeral)
 - The signing key used by the auth callout handler is generated in-memory and not persisted
-- KMS is only called at startup, never on the authentication hot path
+- Persistent key storage is only used at startup, never on the authentication hot path
 - NACK credentials (`nack.creds`) contain a user nkey seed — treat as a secret (store as a K8s Secret)
 - Sentinel credentials (`sentinel.creds`) are for testing only — the sentinel user has all pub/sub permissions denied, and only serves to trigger the auth callout
 - K8s OIDC backend validates JWT signatures via JWKS, enforces issuer/audience/expiry claims

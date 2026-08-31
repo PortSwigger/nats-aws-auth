@@ -11,7 +11,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/aws/aws-sdk-go-v2/service/kms"
 	"github.com/nats-io/jwt/v2"
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nkeys"
@@ -27,10 +26,10 @@ import (
 
 type natsConnection struct {
 	nc             *nats.Conn
-	operatorKey    *KMSKey
-	sysKey         *KMSKey
+	operatorKey    *StoredKey
+	sysKey         *StoredKey
 	operatorSigner jwt.SignFn
-	operatorKP     *dummyKeyPair
+	operatorKP     nkeys.KeyPair
 }
 
 type accountConfig struct {
@@ -40,84 +39,71 @@ type accountConfig struct {
 	authUserKP nkeys.KeyPair
 }
 
-func runAuthService(ctx context.Context, authAccountName, appAccountName, region, natsURL, appAccountKeyAlias string, authorizer auth.Authorizer, logger *zap.Logger) {
-	logger.Info("NATS Client with KMS-signed credentials")
+func runAuthService(ctx context.Context, keyStore KeyStore, authAccountName, appAccountName, natsURL, aliasPrefix, appAccountKeyAlias string, authorizer auth.Authorizer, logger *zap.Logger) {
+	logger.Info("NATS client with stored signing keys", zap.String("key_storage", keyStore.Name()))
 
-	client := setupAWSForAuthService(ctx, region, logger)
-	conn := setupNATSConnection(ctx, client, natsURL, logger)
+	conn := setupNATSConnection(ctx, keyStore, natsURL, aliasPrefix, logger)
 	defer conn.nc.Close()
 
-	// Look up APP account KMS key if alias provided
-	var appAccountKey *KMSKey
+	// Look up APP account key if a name is provided.
+	var appAccountKey *StoredKey
 	if appAccountKeyAlias != "" {
-		appAccountKey = lookupAppAccountKey(ctx, client, appAccountKeyAlias, logger)
+		appAccountKey = lookupAppAccountKey(ctx, keyStore, appAccountKeyAlias, logger)
 	}
 
-	accounts := fetchAndConfigureAccounts(ctx, client, conn, authAccountName, appAccountName, appAccountKey, logger)
+	accounts := fetchAndConfigureAccounts(conn, authAccountName, appAccountName, appAccountKey, logger)
 
 	startAuthService(conn.nc, accounts, authAccountName, appAccountName, natsURL, authorizer, logger)
 }
 
-func setupAWSForAuthService(ctx context.Context, region string, logger *zap.Logger) *kms.Client {
-	logger.Info("Loading AWS configuration...")
-	cfg, err := loadAWSConfig(ctx, region)
-	if err != nil {
-		logger.Fatal("Failed to load AWS config", zap.Error(err))
-	}
-	client := kms.NewFromConfig(cfg)
-	logger.Debug("AWS config loaded successfully")
-	return client
-}
-
-func setupNATSConnection(ctx context.Context, client *kms.Client, natsURL string, logger *zap.Logger) *natsConnection {
-	operatorKey := lookupOperatorKey(ctx, client, logger)
-	sysKey := lookupSysAccountKey(ctx, client, logger)
+func setupNATSConnection(ctx context.Context, keyStore KeyStore, natsURL, aliasPrefix string, logger *zap.Logger) *natsConnection {
+	operatorKey := lookupOperatorKey(ctx, keyStore, aliasPrefix, logger)
+	sysKey := lookupSysAccountKey(ctx, keyStore, aliasPrefix, logger)
 
 	userKP := generateUserKeyPair(logger)
-	userJWT := createSysUserJWT(ctx, client, userKP, sysKey, logger)
+	userJWT := createSysUserJWT(userKP, sysKey, logger)
 
 	nc := connectToNATSServer(natsURL, userJWT, userKP, logger)
 	testNATSConnection(nc, logger)
-
-	operatorSigner := createKMSSigner(ctx, client, operatorKey.KeyID)
-	operatorKP := &dummyKeyPair{pubKey: operatorKey.PublicKey}
 
 	return &natsConnection{
 		nc:             nc,
 		operatorKey:    operatorKey,
 		sysKey:         sysKey,
-		operatorSigner: operatorSigner,
-		operatorKP:     operatorKP,
+		operatorSigner: operatorKey.Signer,
+		operatorKP:     operatorKey.KeyPair,
 	}
 }
 
-func lookupOperatorKey(ctx context.Context, client *kms.Client, logger *zap.Logger) *KMSKey {
-	logger.Info("Looking up Operator key from KMS (alias: nats-operator)...")
-	operatorKey, err := getExistingKMSKey(ctx, client, "alias/nats-operator", nkeys.PrefixByteOperator)
+func lookupOperatorKey(ctx context.Context, keyStore KeyStore, aliasPrefix string, logger *zap.Logger) *StoredKey {
+	keyName := aliasPrefix + "-operator"
+	logger.Info("Looking up Operator key...", zap.String("name", keyName), zap.String("key_storage", keyStore.Name()))
+	operatorKey, err := keyStore.Get(ctx, nkeys.PrefixByteOperator, keyName)
 	if err != nil {
-		logger.Fatal("Failed to find Operator key in KMS. Please run with -generate first to create the KMS keys.", zap.Error(err))
+		logger.Fatal("Failed to find Operator key. Please run with --generate first to create the keys.", zap.Error(err))
 	}
-	logger.Debug("Operator key found", zap.String("publicKey", operatorKey.PublicKey), zap.String("keyID", operatorKey.KeyID))
+	logger.Debug("Operator key found", zap.String("publicKey", operatorKey.PublicKey), zap.String("reference", operatorKey.Reference))
 	return operatorKey
 }
 
-func lookupSysAccountKey(ctx context.Context, client *kms.Client, logger *zap.Logger) *KMSKey {
-	logger.Info("Looking up SYS Account key from KMS (alias: nats-sys-account)...")
-	sysKey, err := getExistingKMSKey(ctx, client, "alias/nats-sys-account", nkeys.PrefixByteAccount)
+func lookupSysAccountKey(ctx context.Context, keyStore KeyStore, aliasPrefix string, logger *zap.Logger) *StoredKey {
+	keyName := aliasPrefix + "-sys-account"
+	logger.Info("Looking up SYS Account key...", zap.String("name", keyName), zap.String("key_storage", keyStore.Name()))
+	sysKey, err := keyStore.Get(ctx, nkeys.PrefixByteAccount, keyName)
 	if err != nil {
-		logger.Fatal("Failed to find SYS Account key in KMS. Please run with -generate first to create the KMS keys.", zap.Error(err))
+		logger.Fatal("Failed to find SYS Account key. Please run with --generate first to create the keys.", zap.Error(err))
 	}
-	logger.Debug("SYS Account key found", zap.String("publicKey", sysKey.PublicKey), zap.String("keyID", sysKey.KeyID))
+	logger.Debug("SYS Account key found", zap.String("publicKey", sysKey.PublicKey), zap.String("reference", sysKey.Reference))
 	return sysKey
 }
 
-func lookupAppAccountKey(ctx context.Context, client *kms.Client, alias string, logger *zap.Logger) *KMSKey {
-	logger.Info("Looking up APP account key from KMS...", zap.String("alias", alias))
-	appKey, err := getExistingKMSKey(ctx, client, "alias/"+alias, nkeys.PrefixByteAccount)
+func lookupAppAccountKey(ctx context.Context, keyStore KeyStore, name string, logger *zap.Logger) *StoredKey {
+	logger.Info("Looking up APP account key...", zap.String("name", name), zap.String("key_storage", keyStore.Name()))
+	appKey, err := keyStore.Get(ctx, nkeys.PrefixByteAccount, name)
 	if err != nil {
-		logger.Fatal("Failed to find APP account key in KMS. Please run with --generate-credentials first to create the KMS key.", zap.Error(err))
+		logger.Fatal("Failed to find APP account key. Please run with --generate-credentials first to create the key.", zap.Error(err))
 	}
-	logger.Debug("APP Account key found", zap.String("publicKey", appKey.PublicKey), zap.String("keyID", appKey.KeyID))
+	logger.Debug("APP Account key found", zap.String("publicKey", appKey.PublicKey), zap.String("reference", appKey.Reference))
 	return appKey
 }
 
@@ -135,12 +121,10 @@ func generateUserKeyPair(logger *zap.Logger) nkeys.KeyPair {
 	return userKP
 }
 
-func createSysUserJWT(ctx context.Context, client *kms.Client, userKP nkeys.KeyPair, sysKey *KMSKey, logger *zap.Logger) string {
-	logger.Info("Creating user JWT signed by SYS account (via KMS)...")
-	signer := createKMSSigner(ctx, client, sysKey.KeyID)
-
+func createSysUserJWT(userKP nkeys.KeyPair, sysKey *StoredKey, logger *zap.Logger) string {
+	logger.Info("Creating user JWT signed by SYS account...")
 	userPubKey, _ := userKP.PublicKey()
-	userJWT, err := createUserJWT(userPubKey, sysKey.PublicKey, signer)
+	userJWT, err := createUserJWT(userPubKey, sysKey.PublicKey, sysKey.Signer)
 	if err != nil {
 		logger.Fatal("Failed to create user JWT", zap.Error(err))
 	}
@@ -174,7 +158,7 @@ func testNATSConnection(nc *nats.Conn, logger *zap.Logger) {
 	}
 	defer func() { _ = sub.Unsubscribe() }()
 
-	testMsg := []byte("Hello from KMS-signed NATS client!")
+	testMsg := []byte("Hello from stored-key-signed NATS client!")
 	if err := nc.Publish("test.subject", testMsg); err != nil {
 		logger.Fatal("Failed to publish", zap.Error(err))
 	}
@@ -189,7 +173,7 @@ func testNATSConnection(nc *nats.Conn, logger *zap.Logger) {
 	logger.Info("Success! Connection and messaging work correctly.")
 }
 
-func fetchAndConfigureAccounts(ctx context.Context, client *kms.Client, conn *natsConnection, authAccountName, appAccountName string, appAccountKey *KMSKey, logger *zap.Logger) *accountConfig {
+func fetchAndConfigureAccounts(conn *natsConnection, authAccountName, appAccountName string, appAccountKey *StoredKey, logger *zap.Logger) *accountConfig {
 	signingKP := generateSigningKeyPair(logger)
 	authJWT, appJWT := fetchAccountsFromNATS(conn.nc, authAccountName, appAccountName, logger)
 
@@ -311,20 +295,20 @@ func logAccountInfo(claims *jwt.AccountClaims, logger *zap.Logger) {
 	}
 }
 
-func ensureAppAccountExists(conn *natsConnection, appJWT, appAccountName string, appAccountKey *KMSKey, logger *zap.Logger) *jwt.AccountClaims {
+func ensureAppAccountExists(conn *natsConnection, appJWT, appAccountName string, appAccountKey *StoredKey, logger *zap.Logger) *jwt.AccountClaims {
 	if appJWT != "" {
 		appClaims, err := jwt.DecodeAccountClaims(appJWT)
 		if err != nil {
 			logger.Fatal("Failed to decode APP account JWT", zap.Error(err))
 		}
-		// If KMS key is configured, verify the existing account matches
+		// If a persistent key is configured, verify the existing account matches.
 		if appAccountKey != nil && appClaims.Subject != appAccountKey.PublicKey {
 			logger.Info("APP account public key mismatch",
 				zap.String("nats", appClaims.Subject),
-				zap.String("kms", appAccountKey.PublicKey))
-			logger.Info("Deleting old APP account from resolver to replace with KMS-backed identity...")
+				zap.String("stored", appAccountKey.PublicKey))
+			logger.Info("Deleting old APP account from resolver to replace with stored identity...")
 			deleteAccountFromResolver(conn, appClaims.Subject, logger)
-			// Fall through to create a new account with the KMS key
+			// Fall through to create a new account with the stored key.
 		} else {
 			return appClaims
 		}
@@ -334,9 +318,9 @@ func ensureAppAccountExists(conn *natsConnection, appJWT, appAccountName string,
 
 	var appPubKey string
 	if appAccountKey != nil {
-		// Use the stable KMS-backed key
+		// Use the stable stored key.
 		appPubKey = appAccountKey.PublicKey
-		logger.Debug("APP account public key (from KMS)", zap.String("publicKey", appPubKey))
+		logger.Debug("APP account public key (from key storage)", zap.String("publicKey", appPubKey))
 	} else {
 		// Fallback: ephemeral key (original behaviour)
 		appKP, err := nkeys.CreateAccount()
@@ -436,7 +420,7 @@ func updateAuthAccount(conn *natsConnection, authClaims *jwt.AccountClaims, sign
 }
 
 func publishUpdatedAuthAccount(conn *natsConnection, authClaims *jwt.AccountClaims, logger *zap.Logger) {
-	logger.Info("Re-signing AUTH account JWT with Operator (via KMS)...")
+	logger.Info("Re-signing AUTH account JWT with Operator...")
 
 	updatedAuthJWT, err := authClaims.EncodeWithSigner(conn.operatorKP, conn.operatorSigner)
 	if err != nil {
@@ -458,7 +442,7 @@ func publishUpdatedAuthAccount(conn *natsConnection, authClaims *jwt.AccountClai
 	logger.Debug("- External authorization (auth callout) enabled")
 }
 
-func updateAppAccount(conn *natsConnection, appClaims *jwt.AccountClaims, signingKP nkeys.KeyPair, appAccountKey *KMSKey, logger *zap.Logger) {
+func updateAppAccount(conn *natsConnection, appClaims *jwt.AccountClaims, signingKP nkeys.KeyPair, appAccountKey *StoredKey, logger *zap.Logger) {
 	logger.Info("Configuring APP account (signing key + JetStream)...")
 
 	signingPubKey, _ := signingKP.PublicKey()
@@ -467,10 +451,10 @@ func updateAppAccount(conn *natsConnection, appClaims *jwt.AccountClaims, signin
 		appClaims.SigningKeys = make(jwt.SigningKeys)
 	}
 
-	// Ensure the KMS key is always a signing key so pre-signed JWTs (e.g. NACK) remain valid
+	// Ensure the persistent key is always a signing key so pre-signed JWTs (e.g. NACK) remain valid.
 	if appAccountKey != nil {
 		appClaims.SigningKeys.Add(appAccountKey.PublicKey)
-		logger.Debug("Ensured KMS key is a signing key", zap.String("kmsKey", appAccountKey.PublicKey))
+		logger.Debug("Ensured stored key is a signing key", zap.String("storedKey", appAccountKey.PublicKey))
 	}
 
 	appClaims.SigningKeys.Add(signingPubKey)
@@ -640,7 +624,7 @@ func testAuthUserMessaging(authNC *nats.Conn, logger *zap.Logger) {
 
 func logSuccessfulSetup(logger *zap.Logger) {
 	logger.Info("SUCCESS! Setup completed:")
-	logger.Debug("Connected to NATS as SYS user with KMS-signed credentials")
+	logger.Debug("Connected to NATS as SYS user with stored-key-signed credentials")
 	logger.Debug("Fetched all account JWTs from NATS server")
 	logger.Debug("Generated signing key for AUTH and APP accounts")
 	logger.Debug("Configured external authorization (auth callout) on AUTH account")
