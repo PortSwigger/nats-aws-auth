@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	"time"
 
@@ -39,8 +40,9 @@ var (
 )
 
 // NewValidatorFromURL creates a new JWT validator that fetches JWKS from an HTTP URL.
-func NewValidatorFromURL(jwksURL, issuer, audience string) (*Validator, error) {
+func NewValidatorFromURL(client *http.Client, jwksURL, issuer, audience string) (*Validator, error) {
 	jwks, err := keyfunc.Get(jwksURL, keyfunc.Options{
+		Client:            client,
 		RefreshInterval:   time.Hour,
 		RefreshRateLimit:  time.Minute * 5,
 		RefreshTimeout:    time.Second * 10,

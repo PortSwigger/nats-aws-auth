@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -697,20 +698,25 @@ func initAuthorizer(ctx context.Context, backend, jwksURL, jwksPath, jwtIssuer, 
 func initK8sOIDCAuthorizer(ctx context.Context, jwksURL, jwksPath, jwtIssuer, jwtAudience string, logger *zap.Logger) auth.Authorizer {
 	logger.Info("Initializing K8s OIDC auth backend...")
 
-	validator := initJWTValidator(jwksPath, jwksURL, jwtIssuer, jwtAudience, logger)
-	k8sClient := initK8sClient(ctx, logger)
+	k8sConfig := initK8sConfig(logger)
+	validator := initJWTValidator(k8sConfig, jwksPath, jwksURL, jwtIssuer, jwtAudience, logger)
+	k8sClient := initK8sClient(ctx, k8sConfig, logger)
 
 	return auth.NewK8sOIDCAuthorizer(validator, k8sClient)
 }
 
-func initJWTValidator(jwksPath, jwksURL, jwtIssuer, jwtAudience string, logger *zap.Logger) *jwtvalidator.Validator {
+func initJWTValidator(k8sConfig *rest.Config, jwksPath, jwksURL, jwtIssuer, jwtAudience string, logger *zap.Logger) *jwtvalidator.Validator {
 	var validator *jwtvalidator.Validator
 	var err error
 
 	if jwksPath != "" {
 		validator, err = jwtvalidator.NewValidatorFromFile(jwksPath, jwtIssuer, jwtAudience)
 	} else {
-		validator, err = jwtvalidator.NewValidatorFromURL(jwksURL, jwtIssuer, jwtAudience)
+		var client *http.Client
+		client, err = newJWKSHTTPClient(k8sConfig, jwksURL)
+		if err == nil {
+			validator, err = jwtvalidator.NewValidatorFromURL(client, jwksURL, jwtIssuer, jwtAudience)
+		}
 	}
 
 	if err != nil {
@@ -720,11 +726,48 @@ func initJWTValidator(jwksPath, jwksURL, jwtIssuer, jwtAudience string, logger *
 	return validator
 }
 
-func initK8sClient(ctx context.Context, logger *zap.Logger) *k8s.Client {
+func newJWKSHTTPClient(k8sConfig *rest.Config, jwksURL string) (*http.Client, error) {
+	// The in-cluster transport sends the service account token, so only use it
+	// for Kubernetes API endpoints. External JWKS URLs use the system trust pool
+	// and must never receive Kubernetes credentials.
+	if !isKubernetesAPIURL(jwksURL, k8sConfig.Host) {
+		return http.DefaultClient, nil
+	}
+
+	return rest.HTTPClientFor(k8sConfig)
+}
+
+func isKubernetesAPIURL(jwksURL, apiServerURL string) bool {
+	jwksEndpoint, err := url.Parse(jwksURL)
+	if err != nil || !strings.EqualFold(jwksEndpoint.Scheme, "https") {
+		return false
+	}
+	apiServer, err := url.Parse(apiServerURL)
+	if err != nil {
+		return false
+	}
+
+	jwksHost := strings.ToLower(strings.TrimSuffix(jwksEndpoint.Hostname(), "."))
+	apiServerHost := strings.ToLower(strings.TrimSuffix(apiServer.Hostname(), "."))
+	if jwksHost == "" {
+		return false
+	}
+
+	return jwksHost == apiServerHost ||
+		jwksHost == "kubernetes" ||
+		jwksHost == "kubernetes.default" ||
+		jwksHost == "kubernetes.default.svc"
+}
+
+func initK8sConfig(logger *zap.Logger) *rest.Config {
 	k8sConfig, err := rest.InClusterConfig()
 	if err != nil {
 		logger.Fatal("Failed to get in-cluster K8s config", zap.Error(err))
 	}
+	return k8sConfig
+}
+
+func initK8sClient(ctx context.Context, k8sConfig *rest.Config, logger *zap.Logger) *k8s.Client {
 	clientset, err := kubernetes.NewForConfig(k8sConfig)
 	if err != nil {
 		logger.Fatal("Failed to create K8s clientset", zap.Error(err))
