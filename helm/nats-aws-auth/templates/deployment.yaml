@@ -10,6 +10,8 @@ spec:
   template:
     metadata:
       labels: {{- include "nats-aws-auth.selectorLabels" . | nindent 8 }}
+      annotations:
+        checksum/permissions: {{ .Values.auth.config | sha256sum }}
     spec:
       serviceAccountName: {{ .Values.serviceAccount.name }}
       securityContext: {{- toYaml .Values.podSecurityContext | nindent 8 }}
@@ -28,6 +30,7 @@ spec:
             - --sys-account={{ .Values.accounts.sys }}
             - --auth-account-name={{ .Values.accounts.auth }}
             - --app-account-name={{ .Values.accounts.app }}
+            - --config=/etc/nats-aws-auth/nats-aws-auth.toml
             - --auth-backend={{ .Values.auth.backend }}
             - --jwt-issuer={{ .Values.jwt.issuer }}
             - --jwt-audience={{ .Values.jwt.audience }}
@@ -49,3 +52,12 @@ spec:
               port: http
             initialDelaySeconds: 5
           resources: {{- toYaml .Values.resources | nindent 12 }}
+
+          volumeMounts:
+            - name: permissions
+              mountPath: /etc/nats-aws-auth
+              readOnly: true
+      volumes:
+        - name: permissions
+          configMap:
+            name: {{ include "nats-aws-auth.fullname" . }}-permissions

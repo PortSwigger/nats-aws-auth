@@ -202,3 +202,24 @@ tests:
       - equal:
           path: spec.template.spec.serviceAccountName
           value: custom-sa
+
+  - it: should mount config permissions by default
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].args
+          content: --config=/etc/nats-aws-auth/nats-aws-auth.toml
+      - equal:
+          path: spec.template.spec.containers[0].volumeMounts[0].readOnly
+          value: true
+
+  - it: should mount config even when legacy permissions are enabled
+    set:
+      auth.config: |
+        legacy-serviceaccount-permissions = true
+        permission = []
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].args
+          content: --config=/etc/nats-aws-auth/nats-aws-auth.toml
+      - exists:
+          path: spec.template.spec.volumes

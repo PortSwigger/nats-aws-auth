@@ -134,7 +134,7 @@ func (h *AuthCalloutHandler) authorize(claims *jwt.AuthorizationRequestClaims) (
 }
 
 func convertPermissions(perms auth.Permissions) jwt.UserPermissionLimits {
-	return jwt.UserPermissionLimits{
+	limits := jwt.UserPermissionLimits{
 		Permissions: jwt.Permissions{
 			Pub: jwt.Permission{
 				Allow: perms.Pub,
@@ -151,6 +151,13 @@ func convertPermissions(perms auth.Permissions) jwt.UserPermissionLimits {
 			},
 		},
 	}
+	if len(perms.Pub) == 0 {
+		limits.Permissions.Pub.Deny = []string{">"}
+	}
+	if len(perms.Sub) == 0 {
+		limits.Permissions.Sub.Deny = []string{">"}
+	}
+	return limits
 }
 
 // createUserJWTForCallout creates a user JWT for the authorized user

@@ -26,7 +26,7 @@ There are two distinct ways clients authenticate:
 App ──(K8s SA token)──► NATS Server ──(auth callout)──► nats-aws-auth
                                                               │
                                                     1. Validate K8s OIDC token
-                                                    2. Look up SA permissions
+                                                    2. Resolve configured permissions
                                                     3. Issue user JWT (ephemeral key)
                                                               │
 App ◄──(authorized into APP account)──── NATS Server ◄────────┘
@@ -130,7 +130,51 @@ For local development, the same workflow can use directory-backed keys without A
 | `--auth-backend` | `allow-all` | Auth backend (`k8s-oidc` or `allow-all`) |
 | `--jwks-url` | | JWKS URL for JWT validation (k8s-oidc backend) |
 | `--jwt-issuer` | | Expected JWT issuer (k8s-oidc backend) |
-| `--jwt-audience` | `nats` | Expected JWT audience (k8s-oidc backend) |
+| `--jwt-audience` | `nats` | Expected JWT audience (all k8s-oidc tokens) |
+| `--config` | `nats-aws-auth.toml` | Permissions TOML file |
+
+## Permissions
+
+The `k8s-oidc` backend defaults to reading `nats-aws-auth.toml` at startup:
+
+```toml
+legacy-serviceaccount-permissions = false
+
+[[permission]]
+subject = "system:serviceaccount:default:orders"
+allowed-pub-subjects = ["orders.events.>"]
+allowed-sub-subjects = ["orders.commands.*", "_INBOX.>"]
+
+[[permission]]
+subject = "system:serviceaccount:default:metrics"
+allowed-pub-subjects = ["metrics.>"]
+allowed-sub-subjects = []
+```
+
+Every authenticated client receives publish access to `<namespace>.>` and
+subscribe access to `<namespace>.>`, `_INBOX.>`, and
+`_INBOX_<namespace>_<serviceaccount>.>`. Namespace and ServiceAccount name are
+extracted from the validated `sub` claim, which must have the form
+`system:serviceaccount:<namespace>:<serviceaccount>`. No ServiceAccount lookup or
+`kubernetes.io` claim is needed for these defaults.
+
+Permission blocks match `sub` exactly and add subjects to those defaults. An
+absent block or empty subject lists preserve the defaults. Duplicate token
+subjects, unknown config keys, and invalid NATS subjects cause startup to fail.
+Restart after changing the file. JWT signature, issuer, audience, and expiry
+validation remain in effect.
+
+Set the top-level `legacy-serviceaccount-permissions = true` to also watch
+ServiceAccounts and add subjects from the comma-separated
+`nats.io/allowed-pub-subjects` and `nats.io/allowed-sub-subjects` annotations.
+Default, TOML, and legacy permissions are combined without duplicates. A missing
+ServiceAccount does not prevent default or TOML permissions from being granted.
+The legacy option defaults to `false`.
+
+For Helm, put the TOML contents in `auth.config`; the chart mounts a ConfigMap and
+rolls pods when it changes. The default configuration grants the namespace and inbox permissions. ServiceAccount read RBAC is needed only when legacy permissions are
+enabled; otherwise `rbac.create` can be set to `false`. The `allow-all` backend
+ignores the permissions configuration.
 
 ## How it works
 

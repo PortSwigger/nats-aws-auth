@@ -34,6 +34,10 @@ accounts:
 # Auth backend
 auth:
   backend: "k8s-oidc"  # or "allow-all"
+  # TOML loaded at startup. Empty configuration preserves namespace and inbox defaults.
+  config: |
+    legacy-serviceaccount-permissions = false
+    permission = []
 
 # K8s OIDC config (when auth.backend = k8s-oidc)
 jwt:

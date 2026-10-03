@@ -1,6 +1,7 @@
 package jwt
 
 import (
+	"github.com/golang-jwt/jwt/v5"
 	"os"
 	"path/filepath"
 	"testing"
@@ -190,5 +191,31 @@ func TestValidateToken_WrongAudience(t *testing.T) {
 
 	if !IsClaimsError(err) {
 		t.Errorf("expected claims validation error, got %v", err)
+	}
+}
+
+func TestExtractTokenSubject(t *testing.T) {
+	validator := &Validator{}
+	for _, tc := range []struct {
+		subject interface{}
+		valid   bool
+	}{
+		{"system:serviceaccount:default:orders", true}, {nil, false}, {"", false}, {42, false}, {"system:serviceaccount::app", false}, {"system:serviceaccount:>:app", false}, {"system:serviceaccount:namespace:app:extra", false}, {"orders", false},
+	} {
+		claims := jwt.MapClaims{"sub": tc.subject, "kubernetes.io": map[string]interface{}{"namespace": "other", "serviceaccount": map[string]interface{}{"name": "other"}}}
+		extracted, err := validator.extractK8sClaims(claims)
+		if (err == nil) != tc.valid {
+			t.Fatalf("sub=%v error=%v", tc.subject, err)
+		}
+		if tc.valid && (extracted.Subject != tc.subject || extracted.Namespace != "default" || extracted.ServiceAccount != "orders") {
+			t.Fatalf("wrong subject: %q", extracted.Subject)
+		}
+	}
+}
+
+func TestSubjectWithoutKubernetesClaims(t *testing.T) {
+	claims, err := (&Validator{}).extractK8sClaims(jwt.MapClaims{"sub": "system:serviceaccount:payments:worker"})
+	if err != nil || claims.Namespace != "payments" || claims.ServiceAccount != "worker" {
+		t.Fatalf("claims=%+v error=%v", claims, err)
 	}
 }

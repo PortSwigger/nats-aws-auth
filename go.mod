@@ -3,6 +3,7 @@ module github.com/portswigger/nats-aws-auth
 go 1.25.7
 
 require (
+	github.com/BurntSushi/toml v1.5.0
 	github.com/MicahParks/keyfunc/v2 v2.1.0
 	github.com/aws/aws-sdk-go-v2 v1.41.1
 	github.com/aws/aws-sdk-go-v2/config v1.32.7

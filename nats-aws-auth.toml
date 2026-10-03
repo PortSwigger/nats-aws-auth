@@ -1,0 +1,7 @@
+legacy-serviceaccount-permissions = false
+
+# Permissions for tokens with subject "system:serviceaccount:default:app". Restart the service after edits.
+[[permission]]
+subject = "system:serviceaccount:default:app"
+allowed-pub-subjects = ["events.>"]
+allowed-sub-subjects = ["commands.>", "_INBOX.>"]
