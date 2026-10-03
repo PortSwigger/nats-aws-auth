@@ -43,10 +43,10 @@ func (h *AuthCalloutHandler) HandleAuthRequest(msg *nats.Msg) {
 
 	h.logAuthRequest(authClaims)
 
-	authorized, userName, permissions := h.authorize(authClaims)
+	authorized, userName, permissions, authorizationErr := h.authorize(authClaims)
 
 	if !authorized {
-		h.logger.Info("Authorization denied")
+		h.logAuthorizationDenied(authClaims, authorizationErr)
 		status = "denied"
 		h.respondWithError(msg, authClaims.UserNkey, "authorization denied")
 		return
@@ -99,6 +99,32 @@ func (h *AuthCalloutHandler) logAuthRequest(authClaims *jwt.AuthorizationRequest
 		zap.String("auth_method", authMethod))
 }
 
+func (h *AuthCalloutHandler) logAuthorizationDenied(authClaims *jwt.AuthorizationRequestClaims, err error) {
+	clientInfo := authClaims.ClientInformation
+	connect := authClaims.ConnectOptions
+	fields := []zap.Field{
+		zap.String("user_nkey", authClaims.UserNkey),
+		zap.String("server_id", authClaims.Server.ID),
+		zap.String("server_name", authClaims.Server.Name),
+		zap.Uint64("client_id", clientInfo.ID),
+		zap.String("client_name", clientInfo.Name),
+		zap.String("client_host", clientInfo.Host),
+		zap.String("client_kind", clientInfo.Kind),
+		zap.String("client_type", clientInfo.Type),
+		zap.String("client_language", connect.Lang),
+		zap.String("client_version", connect.Version),
+		zap.String("auth_method", determineAuthMethod(connect)),
+		zap.Int("credential_length", selectedCredentialLength(connect)),
+	}
+	if err != nil {
+		fields = append(fields, zap.Error(err))
+	} else {
+		fields = append(fields, zap.String("reason", "authorizer denied the request without a reason"))
+	}
+
+	h.logger.Warn("Authorization denied", fields...)
+}
+
 func determineAuthMethod(connect jwt.ConnectOptions) string {
 	if connect.Token != "" {
 		return "bearer_token"
@@ -112,8 +138,15 @@ func determineAuthMethod(connect jwt.ConnectOptions) string {
 	return "none"
 }
 
+func selectedCredentialLength(connect jwt.ConnectOptions) int {
+	if connect.Token != "" {
+		return len(connect.Token)
+	}
+	return len(connect.JWT)
+}
+
 // authorize makes the authorization decision using the pluggable Authorizer
-func (h *AuthCalloutHandler) authorize(claims *jwt.AuthorizationRequestClaims) (bool, string, jwt.UserPermissionLimits) {
+func (h *AuthCalloutHandler) authorize(claims *jwt.AuthorizationRequestClaims) (bool, string, jwt.UserPermissionLimits, error) {
 	token := claims.ConnectOptions.Token
 	if token == "" {
 		token = claims.ConnectOptions.JWT
@@ -121,16 +154,15 @@ func (h *AuthCalloutHandler) authorize(claims *jwt.AuthorizationRequestClaims) (
 
 	authorized, userName, perms, err := h.authorizer.Authorize(token)
 	if err != nil {
-		h.logger.Error("Authorizer error", zap.Error(err))
-		return false, "", jwt.UserPermissionLimits{}
+		return false, "", jwt.UserPermissionLimits{}, err
 	}
 
 	if !authorized {
-		return false, "", jwt.UserPermissionLimits{}
+		return false, "", jwt.UserPermissionLimits{}, nil
 	}
 
 	permissions := convertPermissions(perms)
-	return true, userName, permissions
+	return true, userName, permissions, nil
 }
 
 func convertPermissions(perms auth.Permissions) jwt.UserPermissionLimits {

@@ -1,7 +1,9 @@
 package auth
 
 import (
+	"errors"
 	"fmt"
+	"strings"
 	"testing"
 
 	jwtpkg "github.com/portswigger/nats-aws-auth/internal/jwt"
@@ -65,8 +67,8 @@ func TestK8sOIDCAuthorizer_EmptyToken(t *testing.T) {
 	authorizer := NewK8sOIDCAuthorizer(validator, permProvider)
 
 	authorized, _, _, err := authorizer.Authorize("")
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+	if !errors.Is(err, ErrMissingToken) {
+		t.Fatalf("expected missing token error, got: %v", err)
 	}
 	if authorized {
 		t.Fatal("expected not authorized for empty token")
@@ -82,8 +84,8 @@ func TestK8sOIDCAuthorizer_InvalidToken(t *testing.T) {
 	authorizer := NewK8sOIDCAuthorizer(validator, permProvider)
 
 	authorized, _, _, err := authorizer.Authorize("bad-token")
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+	if err == nil || !strings.Contains(err.Error(), "token validation failed: invalid token") {
+		t.Fatalf("expected token validation detail, got: %v", err)
 	}
 	if authorized {
 		t.Fatal("expected not authorized for invalid token")
@@ -101,8 +103,8 @@ func TestK8sOIDCAuthorizer_SANotFound(t *testing.T) {
 	authorizer := NewK8sOIDCAuthorizer(validator, permProvider)
 
 	authorized, _, _, err := authorizer.Authorize("valid-token")
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+	if err == nil || !strings.Contains(err.Error(), `service account "unknown-sa" in namespace "default" is not present in the permissions cache`) {
+		t.Fatalf("expected missing service account detail, got: %v", err)
 	}
 	if authorized {
 		t.Fatal("expected not authorized when SA not found in cache")
