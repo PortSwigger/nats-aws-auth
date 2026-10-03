@@ -666,10 +666,10 @@ func startAuthCalloutHandler(authNC *nats.Conn, accounts *accountConfig, appAcco
 }
 
 // initAuthorizer creates the auth backend based on configuration
-func initAuthorizer(ctx context.Context, backend, jwksURL, jwksPath, jwtIssuer, jwtAudience string, logger *zap.Logger) auth.Authorizer {
+func initAuthorizer(ctx context.Context, backend, jwksURL, jwksPath, jwtIssuer, jwtAudience, configPath string, logger *zap.Logger) auth.Authorizer {
 	switch backend {
 	case "k8s-oidc":
-		return initK8sOIDCAuthorizer(ctx, jwksURL, jwksPath, jwtIssuer, jwtAudience, logger)
+		return initK8sOIDCAuthorizer(ctx, jwksURL, jwksPath, jwtIssuer, jwtAudience, configPath, logger)
 	case "allow-all":
 		logger.Info("Using allow-all auth backend (all connections authorized)")
 		return &auth.AllowAllAuthorizer{}
@@ -679,14 +679,20 @@ func initAuthorizer(ctx context.Context, backend, jwksURL, jwksPath, jwtIssuer, 
 	}
 }
 
-func initK8sOIDCAuthorizer(ctx context.Context, jwksURL, jwksPath, jwtIssuer, jwtAudience string, logger *zap.Logger) auth.Authorizer {
+func initK8sOIDCAuthorizer(ctx context.Context, jwksURL, jwksPath, jwtIssuer, jwtAudience, configPath string, logger *zap.Logger) auth.Authorizer {
 	logger.Info("Initializing K8s OIDC auth backend...")
 
+	permissions, err := auth.LoadConfig(configPath)
+	if err != nil {
+		logger.Fatal("Failed to load permissions configuration", zap.Error(err))
+	}
 	k8sConfig := initK8sConfig(logger)
 	validator := initJWTValidator(k8sConfig, jwksPath, jwksURL, jwtIssuer, jwtAudience, logger)
-	k8sClient := initK8sClient(ctx, k8sConfig, logger)
-
-	return auth.NewK8sOIDCAuthorizer(validator, k8sClient)
+	var legacy auth.PermissionsProvider = auth.NoServiceAccountPermissions{}
+	if permissions.LegacyServiceAccountPermissions {
+		legacy = initK8sClient(ctx, k8sConfig, logger)
+	}
+	return auth.NewConfigAuthorizer(validator, permissions, legacy, jwtAudience)
 }
 
 func initJWTValidator(k8sConfig *rest.Config, jwksPath, jwksURL, jwtIssuer, jwtAudience string, logger *zap.Logger) *jwtvalidator.Validator {

@@ -40,6 +40,8 @@ func main() {
 	var jwtIssuer = flag.String("jwt-issuer", "", "expected JWT issuer for k8s-oidc backend")
 	var jwtAudience = flag.String("jwt-audience", "nats", "expected JWT audience for k8s-oidc backend")
 
+	var configPath = flag.String("config", "nats-aws-auth.toml", "permissions TOML file")
+
 	// Logging flags
 	var debug = flag.Bool("debug", false, "enable debug logging")
 
@@ -72,7 +74,7 @@ func main() {
 		}
 		runGenerateCredentials(ctx, logger, keyStore, *appAccountKeyAlias, *outputDir)
 	} else {
-		authorizer := initAuthorizer(ctx, *authBackend, *jwksURL, *jwksPath, *jwtIssuer, *jwtAudience, logger)
+		authorizer := initAuthorizer(ctx, *authBackend, *jwksURL, *jwksPath, *jwtIssuer, *jwtAudience, *configPath, logger)
 		runAuthService(ctx, keyStore, *authAccountName, *appAccountName, *natsURL, *aliasPrefix, *appAccountKeyAlias, authorizer, logger)
 	}
 }

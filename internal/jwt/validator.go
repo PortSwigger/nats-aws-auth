@@ -2,11 +2,12 @@
 package jwt
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
 	"os"
+	"regexp"
+	"strings"
 	"time"
 
 	"github.com/MicahParks/keyfunc/v2"
@@ -23,6 +24,7 @@ type Validator struct {
 
 // Claims represents the validated JWT claims including Kubernetes-specific fields.
 type Claims struct {
+	Subject        string
 	Namespace      string
 	ServiceAccount string
 	Issuer         string
@@ -197,44 +199,18 @@ func validateTimeClaims(claims jwt.MapClaims, timeFunc func() time.Time) error {
 	return nil
 }
 
-func extractK8sMap(claims jwt.MapClaims) (map[string]interface{}, error) {
-	k8sData, ok := claims["kubernetes.io"]
-	if !ok {
-		return nil, fmt.Errorf("%w: kubernetes.io claim missing", ErrMissingK8sClaims)
-	}
+var namespacePattern = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]*[a-z0-9])?$`)
+var serviceAccountPattern = regexp.MustCompile(`^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$`)
 
-	k8sMap, ok := k8sData.(map[string]interface{})
-	if ok {
-		return k8sMap, nil
+// ParseServiceAccountSubject extracts identity from a Kubernetes service account sub claim.
+func ParseServiceAccountSubject(subject string) (string, string, error) {
+	parts := strings.Split(subject, ":")
+	if len(parts) != 4 || parts[0] != "system" || parts[1] != "serviceaccount" ||
+		len(parts[2]) > 63 || !namespacePattern.MatchString(parts[2]) ||
+		len(parts[3]) > 253 || !serviceAccountPattern.MatchString(parts[3]) {
+		return "", "", fmt.Errorf("%w: invalid service account subject %q", ErrInvalidClaims, subject)
 	}
-
-	jsonData, err := json.Marshal(k8sData)
-	if err != nil {
-		return nil, fmt.Errorf("%w: invalid kubernetes.io format", ErrMissingK8sClaims)
-	}
-	if err := json.Unmarshal(jsonData, &k8sMap); err != nil {
-		return nil, fmt.Errorf("%w: invalid kubernetes.io format", ErrMissingK8sClaims)
-	}
-	return k8sMap, nil
-}
-
-func extractServiceAccountName(k8sMap map[string]interface{}) (string, error) {
-	saData, ok := k8sMap["serviceaccount"]
-	if !ok {
-		return "", fmt.Errorf("%w: serviceaccount claim missing", ErrMissingK8sClaims)
-	}
-
-	saMap, ok := saData.(map[string]interface{})
-	if !ok {
-		return "", fmt.Errorf("%w: invalid serviceaccount format", ErrMissingK8sClaims)
-	}
-
-	saName, ok := saMap["name"].(string)
-	if !ok || saName == "" {
-		return "", fmt.Errorf("%w: serviceaccount name missing or empty", ErrMissingK8sClaims)
-	}
-
-	return saName, nil
+	return parts[2], parts[3], nil
 }
 
 func extractAudienceList(claims jwt.MapClaims) []string {
@@ -260,24 +236,18 @@ func extractAudienceList(claims jwt.MapClaims) []string {
 }
 
 func (v *Validator) extractK8sClaims(claims jwt.MapClaims) (*Claims, error) {
-	k8sMap, err := extractK8sMap(claims)
+	subject, ok := claims["sub"].(string)
+	if !ok {
+		return nil, fmt.Errorf("%w: missing or invalid sub claim", ErrInvalidClaims)
+	}
+	namespace, saName, err := ParseServiceAccountSubject(subject)
 	if err != nil {
 		return nil, err
 	}
-
-	namespace, ok := k8sMap["namespace"].(string)
-	if !ok || namespace == "" {
-		return nil, fmt.Errorf("%w: namespace claim missing or empty", ErrMissingK8sClaims)
-	}
-
-	saName, err := extractServiceAccountName(k8sMap)
-	if err != nil {
-		return nil, err
-	}
-
 	issuer, _ := claims["iss"].(string)
 
 	result := &Claims{
+		Subject:        subject,
 		Namespace:      namespace,
 		ServiceAccount: saName,
 		Issuer:         issuer,
