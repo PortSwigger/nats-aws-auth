@@ -92,7 +92,15 @@ func (v *Validator) Validate(token string) (*Claims, error) {
 
 // ValidateToken validates a JWT token and returns the extracted claims.
 func (v *Validator) ValidateToken(tokenString string) (*Claims, error) {
-	token, err := jwt.Parse(tokenString, v.jwks.Keyfunc, jwt.WithTimeFunc(v.timeFunc))
+	// Standard claims are checked below so that failures can include the values
+	// that caused the rejection. Signature verification is still performed by
+	// Parse before any claims are trusted.
+	token, err := jwt.Parse(
+		tokenString,
+		v.jwks.Keyfunc,
+		jwt.WithTimeFunc(v.timeFunc),
+		jwt.WithoutClaimsValidation(),
+	)
 	if err != nil {
 		if errors.Is(err, jwt.ErrTokenExpired) {
 			return nil, fmt.Errorf("%w: %v", ErrExpiredToken, err)
@@ -170,27 +178,52 @@ func validateAudience(claims jwt.MapClaims, expectedAudience string) error {
 			return nil
 		}
 	}
-	return fmt.Errorf("%w: audience mismatch (expected %q)", ErrInvalidClaims, expectedAudience)
+	return fmt.Errorf(
+		"%w: audience mismatch (expected %q, got %q)",
+		ErrInvalidClaims,
+		expectedAudience,
+		audiences,
+	)
 }
 
 func validateTimeClaims(claims jwt.MapClaims, timeFunc func() time.Time) error {
+	now := timeFunc()
 	exp, ok := claims["exp"].(float64)
 	if !ok {
 		return fmt.Errorf("%w: missing or invalid exp claim", ErrInvalidClaims)
 	}
-	if timeFunc().Unix() > int64(exp) {
-		return ErrExpiredToken
+	expiresAt := time.Unix(int64(exp), 0)
+	if !now.Before(expiresAt) {
+		return fmt.Errorf(
+			"%w (expired_at %s, current_time %s)",
+			ErrExpiredToken,
+			expiresAt.UTC().Format(time.RFC3339),
+			now.UTC().Format(time.RFC3339),
+		)
 	}
 
 	if nbf, ok := claims["nbf"].(float64); ok {
-		if timeFunc().Unix() < int64(nbf) {
-			return fmt.Errorf("%w: token not yet valid", ErrInvalidClaims)
+		notBefore := time.Unix(int64(nbf), 0)
+		if now.Before(notBefore) {
+			return fmt.Errorf(
+				"%w: token not yet valid (not_before %s, current_time %s)",
+				ErrInvalidClaims,
+				notBefore.UTC().Format(time.RFC3339),
+				now.UTC().Format(time.RFC3339),
+			)
 		}
 	}
 
 	if iat, ok := claims["iat"].(float64); ok {
-		if timeFunc().Unix()+60 < int64(iat) {
-			return fmt.Errorf("%w: issued-at is in the future", ErrInvalidClaims)
+		issuedAt := time.Unix(int64(iat), 0)
+		if now.Add(time.Minute).Before(issuedAt) {
+			return fmt.Errorf(
+				"%w: issued-at is in the future (issued_at %s, current_time %s, allowed_clock_skew %s)",
+				ErrInvalidClaims,
+				issuedAt.UTC().Format(time.RFC3339),
+				now.UTC().Format(time.RFC3339),
+				time.Minute,
+			)
 		}
 	}
 
